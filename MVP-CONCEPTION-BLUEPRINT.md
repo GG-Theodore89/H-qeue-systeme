@@ -2,6 +2,17 @@
 
 This document is the shared source of truth for the first working version of the virtual queue platform. It is deliberately limited to an MVP that two developers can complete and demonstrate reliably.
 
+## How to use this document
+
+- Sections 1–5 define **what** the MVP must do.
+- Sections 6–18 define the architecture, data, API, realtime behavior, security, and tests.
+- Sections 19–22 define teamwork, completion rules, and frozen implementation decisions.
+- Sections 23–30 explain the classes/modules, their methods, and the exact file map.
+- Section 31 is the step-by-step realization path; follow it in order.
+- Sections 32–36 provide difficult-code recipes, authorization, errors, teamwork, and quality gates.
+
+Before coding, both developers should read sections 5, 11, 12, 22, 25, and 31. During coding, treat the acceptance checks at the end of every realization step as merge gates.
+
 ## 1. MVP goal
 
 An organization operates one virtual queue. A visitor scans a QR code, receives a ticket without creating an account, follows their position live, and is called by a staff member. The kiosk, staff dashboard, and visitor screen update without refreshing.
@@ -33,7 +44,7 @@ flowchart LR
 - Call next, recall, start service, complete, and no-show actions
 - Real-time updates through Socket.IO
 - Persistent ticket and event history in PostgreSQL
-- Reconnection and ticket recovery using a private public token
+- Ticket access and reconnection using a browser-generated private token
 - Responsive customer interface
 - Basic automated tests
 
@@ -80,7 +91,7 @@ flowchart TB
 
 | ID | Story | Acceptance criteria |
 |---|---|---|
-| US-01 | As a customer, I can scan a QR code and join without an account. | A valid open queue creates exactly one ticket and returns its private token. |
+| US-01 | As a customer, I can scan a QR code and join without an account. | A valid open queue creates exactly one ticket for the browser-generated private token. |
 | US-02 | As a customer, I can see my ticket and people ahead. | Position is calculated from waiting tickets created earlier and updates live. |
 | US-03 | As staff, I can call the next customer. | The oldest waiting ticket is selected once, even if two requests arrive together. |
 | US-04 | As a customer, I know when I am called. | My screen changes to `CALLED` without a refresh. |
@@ -239,7 +250,7 @@ virtual-queue/
 | Route | Screen | Access |
 |---|---|---|
 | `/q/:queueSlug` | Join queue | Public |
-| `/ticket/:publicToken` | Customer live ticket | Token holder |
+| `/ticket` | Customer live ticket | Private token restored from localStorage |
 | `/kiosk/:queueSlug` | QR and Now Serving board | Public |
 | `/staff/login` | Staff login | Public |
 | `/staff/queue/:queueId` | Staff dashboard | Staff only |
@@ -288,6 +299,7 @@ erDiagram
         int last_daily_number
         date number_date
         datetime created_at
+        datetime updated_at
     }
     COUNTER {
         uuid id PK
@@ -298,8 +310,10 @@ erDiagram
     TICKET {
         uuid id PK
         uuid queue_id FK
-        uuid counter_id FK
+        uuid counter_id FK "nullable while WAITING"
         string public_token_hash UK
+        string join_request_id
+        date service_date
         int sequence_number
         string display_number
         string status
@@ -312,7 +326,7 @@ erDiagram
     TICKET_EVENT {
         uuid id PK
         uuid ticket_id FK
-        uuid actor_user_id FK
+        uuid actor_user_id FK "nullable for customer/system"
         string type
         json metadata
         datetime created_at
@@ -321,16 +335,20 @@ erDiagram
 
 ### Database rules
 
-- Unique constraint: `(queue_id, number_date, sequence_number)` or store a separate daily counter table.
+- Unique constraint: `(queue_id, service_date, sequence_number)`.
+- Unique constraint: `(queue_id, join_request_id)` for idempotent join retries.
 - Index tickets on `(queue_id, status, joined_at)`.
-- Store only a hash of the customer public token; return the raw token once.
+- Store only a hash of the customer token; the raw token remains in the browser and is never returned by the API.
 - Never derive authority from `display_number`; use UUIDs internally.
 - Record every meaningful transition in `ticket_events`.
 - Use UTC timestamps in storage and localize only in the UI.
+- Generate the queue's `service_date` in `Africa/Casablanca`; lock the queue row while resetting/incrementing `last_daily_number`.
+- Order FIFO deterministically by `(joined_at, id)`.
+- Add a partial unique database index on `counter_id` for statuses `CALLED` and `SERVING` so one counter cannot hold two active tickets.
 
 ## 10. Concurrency-safe Call Next
 
-Two staff members may click at the same time. The selection and update must happen in one database transaction using a locked row.
+Two staff members on different counters may click at the same time. Selection and update happen in one transaction using a locked row. A test can create two counters even though the default demonstration seed contains one.
 
 ```mermaid
 sequenceDiagram
@@ -341,21 +359,21 @@ sequenceDiagram
     participant IO as Socket.IO
 
     par Simultaneous requests
-        A->>API: POST /queues/:id/call-next
-        B->>API: POST /queues/:id/call-next
+        A->>API: POST call-next {counterId: 1}
+        B->>API: POST call-next {counterId: 2}
     end
     API->>DB: BEGIN; select oldest WAITING<br/>FOR UPDATE SKIP LOCKED
     DB-->>API: Ticket A-001
-    API->>DB: Set A-001 CALLED; COMMIT
+    API->>DB: Set A-001 CALLED at Counter 1; COMMIT
     API->>DB: BEGIN; select oldest unlocked WAITING
     DB-->>API: Ticket A-002
-    API->>DB: Set A-002 CALLED; COMMIT
-    API->>IO: Emit queue and ticket updates
-    IO-->>A: Updated snapshot
-    IO-->>B: Updated snapshot
+    API->>DB: Set A-002 CALLED at Counter 2; COMMIT
+    API->>IO: Emit invalidation events after commit
+    IO-->>A: queue:staff-changed
+    IO-->>B: queue:staff-changed
 ```
 
-Prisma may require a parameterized raw query for `FOR UPDATE SKIP LOCKED`. Keep that query inside the ticket service and cover it with an integration test.
+Prisma may require a parameterized raw query for `FOR UPDATE SKIP LOCKED`. Keep that query inside the ticket repository and cover it with an integration test.
 
 ## 11. REST API contract
 
@@ -365,7 +383,8 @@ All responses use JSON. Errors use:
 {
   "error": {
     "code": "QUEUE_CLOSED",
-    "message": "This queue is currently closed."
+    "message": "This queue is currently closed.",
+    "requestId": "req_..."
   }
 }
 ```
@@ -377,15 +396,15 @@ All responses use JSON. Errors use:
 | `GET` | `/api/auth/me` | Staff | Restore staff session |
 | `GET` | `/api/public/queues/:slug` | Public | Public queue name, open state, and count |
 | `GET` | `/api/public/queues/:slug/board` | Public | Called/serving display numbers |
-| `POST` | `/api/public/queues/:slug/tickets` | Public + rate limit | Join and receive raw public token |
-| `GET` | `/api/public/tickets/:token` | Token | Get own ticket, position, and queue summary |
-| `POST` | `/api/public/tickets/:token/cancel` | Token | Cancel own waiting ticket |
+| `POST` | `/api/public/queues/:slug/tickets` | Public + rate limit | Join using a client-generated token and idempotency key |
+| `GET` | `/api/public/tickets/me` | `X-Ticket-Token` header | Get own ticket, position, and queue summary |
+| `POST` | `/api/public/tickets/me/cancel` | `X-Ticket-Token` header | Cancel own waiting ticket |
 | `GET` | `/api/staff/queues/:queueId/snapshot` | Staff | Full staff queue state |
 | `POST` | `/api/staff/queues/:queueId/open` | Staff | Open queue |
 | `POST` | `/api/staff/queues/:queueId/close` | Staff | Stop new joins |
-| `POST` | `/api/staff/queues/:queueId/call-next` | Staff | Atomically call oldest waiting ticket |
+| `POST` | `/api/staff/queues/:queueId/call-next` | Staff + `{ counterId }` | Atomically call oldest waiting ticket and assign its counter |
 | `POST` | `/api/staff/tickets/:ticketId/recall` | Staff | Repeat call notification |
-| `POST` | `/api/staff/tickets/:ticketId/start` | Staff | Mark serving and assign counter |
+| `POST` | `/api/staff/tickets/:ticketId/start` | Staff | Change the called ticket to serving |
 | `POST` | `/api/staff/tickets/:ticketId/complete` | Staff | Finish service |
 | `POST` | `/api/staff/tickets/:ticketId/no-show` | Staff | Mark called ticket absent |
 
@@ -432,11 +451,13 @@ Sockets notify clients that authoritative state changed. REST remains available 
 
 ### Server-to-client events
 
+For the MVP, Socket.IO events are invalidation notifications. When an event arrives, TanStack Query refetches the authoritative REST view. This removes event-order/version ambiguity and makes reconnection recovery straightforward.
+
 | Event | Room | Payload |
 |---|---|---|
-| `queue:summary-updated` | Public | `{ waitingCount, calledTickets }` |
-| `queue:snapshot-updated` | Staff | `StaffQueueSnapshot` |
-| `ticket:updated` | Ticket | `CustomerTicketView` |
+| `queue:public-changed` | Public | `{ queueId }` |
+| `queue:staff-changed` | Staff | `{ queueId }` |
+| `ticket:changed` | Ticket | `{ ticketId }` |
 | `ticket:recalled` | Ticket | `{ displayNumber, recalledAt }` |
 
 ### Connection flow
@@ -455,8 +476,8 @@ sequenceDiagram
     Client->>Socket: Connect with staff session or ticket token
     Socket->>DB: Validate access
     Socket-->>Client: Joined authorized room
-    Socket-->>Client: ticket:updated / queue:...updated
-    Client->>API: Refetch if event version is newer
+    Socket-->>Client: ticket:changed / queue:...changed
+    Client->>API: Invalidate query and refetch current state
 ```
 
 Never let a client choose arbitrary room names without server-side authorization.
@@ -477,11 +498,12 @@ sequenceDiagram
     Web->>API: GET public queue
     API-->>Web: Queue is open
     Customer->>Web: Tap Join queue
-    Web->>API: POST ticket with idempotency key
+    Web->>Web: Generate customer token and join-request ID
+    Web->>API: POST ticket with token body<br/>and Idempotency-Key header
     API->>DB: Transaction: increment daily number<br/>and create WAITING ticket
     DB-->>API: Ticket A-001
-    API-->>Web: Raw public token and ticket view
-    Web->>Web: Store token in localStorage
+    API-->>Web: Customer ticket view
+    Web->>Web: Keep the raw token in localStorage
     API->>IO: Broadcast updated counts/snapshot
     Web->>IO: Authenticate ticket room
 ```
@@ -503,9 +525,9 @@ sequenceDiagram
     API->>DB: Lock oldest WAITING and set CALLED
     DB-->>API: Updated ticket
     API->>IO: Broadcast updates
-    IO-->>Customer: ticket:updated
-    IO-->>Kiosk: queue:summary-updated
-    IO-->>Dashboard: queue:snapshot-updated
+    IO-->>Customer: ticket:changed, then REST refetch
+    IO-->>Kiosk: queue:public-changed, then REST refetch
+    IO-->>Dashboard: queue:staff-changed, then REST refetch
     Staff->>API: POST start
     Staff->>API: POST complete
 ```
@@ -514,8 +536,9 @@ sequenceDiagram
 
 - Joining a closed queue returns `409 QUEUE_CLOSED`.
 - A customer cannot hold two active tickets for the same queue in the same browser. This is a usability rule, not a complete identity guarantee.
-- Ticket creation accepts an idempotency key to prevent duplicates caused by double taps or retries.
+- Before joining, the browser generates a high-entropy customer token and an idempotency key. Retries reuse both values; the server stores only the token hash and `join_request_id`.
 - `call-next` returns `409 QUEUE_EMPTY` when no ticket is waiting.
+- `call-next` accepts a counter ID, assigns it while changing the ticket to `CALLED`, and returns `409 COUNTER_BUSY` if that counter already has a called/serving ticket.
 - A ticket transition with the wrong current state returns `409 INVALID_TICKET_STATE`.
 - Closing a queue prevents new joins but does not delete existing tickets.
 - The queue date and daily numbering timezone must be configured explicitly; use `Africa/Casablanca` for the initial deployment.
@@ -531,8 +554,9 @@ sequenceDiagram
 - Protect state-changing cookie-authenticated routes against CSRF.
 - Validate every request with Zod and reject unknown fields.
 - Rate-limit login and public ticket creation.
-- Generate customer tokens with a cryptographically secure random generator.
+- Generate customer tokens with Web Crypto in the browser and validate their format on the server.
 - Store token hashes, never raw customer tokens, in the database.
+- Hash high-entropy searchable customer tokens with deterministic SHA-256; password hashing still uses Argon2id.
 - Apply authorization on every staff action and Socket.IO room join.
 - Do not expose customer tokens, database UUIDs, email addresses, or notes on the kiosk.
 - Restrict CORS to configured frontend origins.
@@ -568,7 +592,7 @@ flowchart TB
 - Ticket-state transition rules
 - Ticket display-number generation
 - Joining an open versus closed queue
-- Duplicate join request with the same idempotency key
+- Duplicate join request with the same idempotency key and customer token
 - Two simultaneous `call-next` requests select different tickets
 - Empty queue behavior
 - Customer token cannot access another ticket
@@ -637,7 +661,7 @@ Dates are a suggested starting schedule and can be shifted while preserving the 
 #### Milestone 2 — Walking skeleton
 
 - [ ] Public queue endpoint
-- [ ] Ticket creation with daily display number and private token
+- [ ] Ticket creation with daily display number and hashed private token
 - [ ] Basic customer ticket screen
 - [ ] Basic staff waiting list
 - [ ] Transaction-safe Call Next
@@ -696,19 +720,1153 @@ flowchart LR
     Open --> Scan[Customer scans kiosk QR]
     Scan --> Join[Customer receives ticket]
     Join --> Next[Staff calls next]
-    Next --> Live[All three screens update live]
+    Next --> Live[All three screens receive change events and refetch]
     Live --> Serve[Staff starts and completes service]
     Serve --> Persist[History remains after restart]
 ```
 
-## 22. Decisions required before coding
+## 22. Frozen realization decisions
 
-Record the answers in short files under `docs/decisions/`:
+To prevent the two developers from implementing incompatible assumptions, use these defaults for the MVP and record them under `docs/decisions/`:
 
-1. Will a staff session use a server session store or a signed short-lived JWT cookie?
-2. Does the MVP need multiple counters, or will it seed one counter initially?
-3. What are the exact recall and no-show rules?
-4. Does a customer explicitly tap **Join**, or should opening the QR URL create a ticket immediately? Explicit confirmation is safer for avoiding accidental tickets.
-5. Where will the demonstration be deployed, and does that environment support WebSockets and managed PostgreSQL?
+1. Seed one organization, one queue, one counter, and one staff user. Keep the schema ready for more counters.
+2. A customer must explicitly tap **Join queue** after scanning; opening a URL never creates a ticket.
+3. The browser generates one 32-byte base64url customer token plus one UUID join-request ID per attempt. It reuses them on a retry.
+4. Staff authentication uses an eight-hour signed JWT in a `Secure`, `HttpOnly`, `SameSite=Lax` cookie. Logout clears it.
+5. PostgreSQL is the only source of truth. REST handles commands and snapshots; Socket.IO only announces changes.
+6. A counter can have at most one `CALLED` or `SERVING` ticket. The counter is assigned by **Call Next**.
+7. Recall is allowed only for `CALLED`; it creates an event without changing ticket state.
+8. No-show is a manual staff action. There is no automatic timer in the MVP.
+9. Queue daily numbering uses the `Africa/Casablanca` calendar date, while timestamps are stored in UTC.
+10. Frontend and API should be deployed under the same site where possible; the chosen host must support WebSockets and PostgreSQL.
 
-Do not add Redis, subscriptions, custom forms, or analytics until the walking skeleton and concurrency tests work reliably.
+Do not add Redis, subscriptions, custom forms, analytics, or multiple organizations until the walking skeleton and concurrency tests work reliably.
+
+## 23. How to read the realization design
+
+The following class diagrams describe **responsibilities, dependencies, fields, and method contracts**. They do not require every box to become a JavaScript `class`.
+
+- Prisma models are data records, not active-record classes.
+- Controllers and services may be plain exported objects or functions.
+- Repository and publisher interfaces are useful boundaries for database and Socket.IO code.
+- React uses function components and hooks; the frontend diagram is a module/component diagram expressed with Mermaid class notation.
+- Create a separate file only when it has a clear responsibility. Do not generate empty files just because a diagram contains a box.
+
+The architecture rule is more important than the `class` keyword:
+
+```mermaid
+flowchart LR
+    HTTP[HTTP and Socket adapters] --> APP[Application services]
+    APP --> PORTS[Repository and publisher interfaces]
+    PORTS --> INFRA[Prisma and Socket.IO implementations]
+    INFRA --> DB[(PostgreSQL)]
+```
+
+Dependencies point from the outside toward business behavior. Services never import controllers or React code.
+
+## 24. Domain class diagram
+
+```mermaid
+classDiagram
+    direction LR
+
+    class Organization {
+        +UUID id
+        +string name
+        +Date createdAt
+        +Date updatedAt
+    }
+
+    class User {
+        +UUID id
+        +UUID organizationId
+        +string email
+        -string passwordHash
+        +UserRole role
+        +Date createdAt
+        +Date updatedAt
+    }
+
+    class Queue {
+        +UUID id
+        +UUID organizationId
+        +string name
+        +string slug
+        +string prefix
+        +boolean isOpen
+        +number lastDailyNumber
+        +LocalDate numberDate
+        +Date createdAt
+        +Date updatedAt
+    }
+
+    class Counter {
+        +UUID id
+        +UUID queueId
+        +string name
+        +boolean isActive
+        +Date createdAt
+        +Date updatedAt
+    }
+
+    class Ticket {
+        +UUID id
+        +UUID queueId
+        +UUID counterId
+        -string publicTokenHash
+        +string joinRequestId
+        +LocalDate serviceDate
+        +number sequenceNumber
+        +string displayNumber
+        +TicketStatus status
+        +Date joinedAt
+        +Date calledAt
+        +Date serviceStartedAt
+        +Date finishedAt
+        +Date updatedAt
+    }
+
+    class TicketEvent {
+        +UUID id
+        +UUID ticketId
+        +UUID actorUserId
+        +TicketEventType type
+        +Json metadata
+        +Date createdAt
+    }
+
+    class TicketStatus {
+        <<enumeration>>
+        WAITING
+        CALLED
+        SERVING
+        COMPLETED
+        CANCELLED
+        NO_SHOW
+    }
+
+    class UserRole {
+        <<enumeration>>
+        STAFF
+    }
+
+    class TicketEventType {
+        <<enumeration>>
+        CREATED
+        CALLED
+        RECALLED
+        SERVICE_STARTED
+        COMPLETED
+        CANCELLED
+        NO_SHOW
+    }
+
+    Organization "1" --> "many" User : employs
+    Organization "1" --> "many" Queue : owns
+    Queue "1" --> "many" Counter : has
+    Queue "1" --> "many" Ticket : contains
+    Counter "zero or one" --> "many" Ticket : serves
+    Ticket "1" --> "many" TicketEvent : history
+    User "zero or one" --> "many" TicketEvent : performs
+    Ticket --> TicketStatus
+    User --> UserRole
+    TicketEvent --> TicketEventType
+```
+
+### Domain invariants
+
+- A queue slug is unique.
+- `counterId` is `null` while a ticket is waiting.
+- `actorUserId` is `null` for customer and system events.
+- `(queueId, serviceDate, sequenceNumber)` is unique.
+- `(queueId, joinRequestId)` is unique.
+- `publicTokenHash` is unique and the raw token is never persisted.
+- Only one `CALLED` or `SERVING` ticket may occupy a counter.
+- `displayNumber` is presentation data; authorization always uses UUIDs and credentials.
+- A state change and its `TicketEvent` are committed in the same database transaction.
+
+## 25. Backend application class diagram
+
+```mermaid
+classDiagram
+    direction TB
+
+    class AuthController {
+        +login(req, res) Promise~void~
+        +logout(req, res) void
+        +me(req, res) Promise~void~
+    }
+
+    class PublicQueueController {
+        +getQueue(req, res) Promise~void~
+        +getBoard(req, res) Promise~void~
+    }
+
+    class PublicTicketController {
+        +join(req, res) Promise~void~
+        +getOwn(req, res) Promise~void~
+        +cancelOwn(req, res) Promise~void~
+    }
+
+    class StaffQueueController {
+        +getSnapshot(req, res) Promise~void~
+        +open(req, res) Promise~void~
+        +close(req, res) Promise~void~
+        +callNext(req, res) Promise~void~
+    }
+
+    class StaffTicketController {
+        +recall(req, res) Promise~void~
+        +start(req, res) Promise~void~
+        +complete(req, res) Promise~void~
+        +markNoShow(req, res) Promise~void~
+    }
+
+    class AuthService {
+        -UserRepository users
+        -PasswordHasher passwords
+        -SessionSigner sessions
+        +login(email, password) Promise~StaffSession~
+        +getUser(userId) Promise~StaffUserView~
+        +verifySession(token) StaffPrincipal
+    }
+
+    class QueueService {
+        -QueueRepository queues
+        -RealtimePublisher realtime
+        +getPublicQueue(slug) Promise~PublicQueueView~
+        +getBoard(slug) Promise~PublicBoardView~
+        +getStaffSnapshot(queueId, actor) Promise~StaffQueueSnapshot~
+        +openQueue(queueId, actor) Promise~QueueView~
+        +closeQueue(queueId, actor) Promise~QueueView~
+    }
+
+    class TicketService {
+        -QueueRepository queues
+        -TicketRepository tickets
+        -CustomerTokenService tokens
+        -TicketStateMachine states
+        -RealtimePublisher realtime
+        +joinQueue(slug, requestId, token) Promise~CustomerTicketView~
+        +getCustomerTicket(token) Promise~CustomerTicketView~
+        +cancelTicket(token) Promise~CustomerTicketView~
+        +callNext(queueId, counterId, actor) Promise~StaffTicketView~
+        +recall(ticketId, actor) Promise~StaffTicketView~
+        +startService(ticketId, actor) Promise~StaffTicketView~
+        +completeTicket(ticketId, actor) Promise~StaffTicketView~
+        +markNoShow(ticketId, actor) Promise~StaffTicketView~
+    }
+
+    class TicketStateMachine {
+        +canTransition(from, to) boolean
+        +assertTransition(from, to) void
+        +isTerminal(status) boolean
+    }
+
+    class CustomerTokenService {
+        +validateFormat(rawToken) void
+        +hash(rawToken) string
+    }
+
+    class PasswordHasher {
+        <<interface>>
+        +hash(password) Promise~string~
+        +verify(hash, password) Promise~boolean~
+    }
+
+    class SessionSigner {
+        <<interface>>
+        +sign(user) string
+        +verify(token) StaffPrincipal
+    }
+
+    class QueueRepository {
+        <<interface>>
+        +findBySlug(slug) Promise~QueueRecord~
+        +findById(id) Promise~QueueRecord~
+        +setOpenState(id, isOpen) Promise~QueueRecord~
+        +getPublicBoard(id) Promise~PublicBoardView~
+        +getStaffSnapshot(id) Promise~StaffQueueSnapshot~
+        +staffCanManage(userId, queueId) Promise~boolean~
+    }
+
+    class TicketRepository {
+        <<interface>>
+        +createWithDailyNumber(input) Promise~TicketRecord~
+        +findByTokenHash(hash) Promise~TicketRecord~
+        +getCustomerView(ticketId) Promise~CustomerTicketView~
+        +countAhead(ticketId) Promise~number~
+        +cancelWaitingByToken(hash) Promise~TicketRecord~
+        +callNextAtomic(queueId, counterId, actorId) Promise~TicketRecord~
+        +recordRecall(ticketId, actorId) Promise~TicketRecord~
+        +transitionAtomic(input) Promise~TicketRecord~
+    }
+
+    class UserRepository {
+        <<interface>>
+        +findByEmail(email) Promise~UserRecord~
+        +findById(id) Promise~UserRecord~
+    }
+
+    class PrismaQueueRepository {
+        -PrismaClient db
+    }
+
+    class PrismaTicketRepository {
+        -PrismaClient db
+    }
+
+    class PrismaUserRepository {
+        -PrismaClient db
+    }
+
+    class RealtimePublisher {
+        <<interface>>
+        +queuePublicChanged(queueId) Promise~void~
+        +queueStaffChanged(queueId) Promise~void~
+        +ticketChanged(ticketId) Promise~void~
+        +ticketRecalled(ticketId, recalledAt) Promise~void~
+    }
+
+    class SocketRealtimePublisher {
+        -SocketServer io
+    }
+
+    AuthController --> AuthService
+    PublicQueueController --> QueueService
+    PublicTicketController --> TicketService
+    StaffQueueController --> QueueService
+    StaffQueueController --> TicketService
+    StaffTicketController --> TicketService
+
+    AuthService --> UserRepository
+    AuthService --> PasswordHasher
+    AuthService --> SessionSigner
+    QueueService --> QueueRepository
+    QueueService --> RealtimePublisher
+    TicketService --> QueueRepository
+    TicketService --> TicketRepository
+    TicketService --> CustomerTokenService
+    TicketService --> TicketStateMachine
+    TicketService --> RealtimePublisher
+
+    PrismaQueueRepository ..|> QueueRepository
+    PrismaTicketRepository ..|> TicketRepository
+    PrismaUserRepository ..|> UserRepository
+    SocketRealtimePublisher ..|> RealtimePublisher
+```
+
+### Responsibility rules
+
+- **Controller:** translate HTTP input/output only; no Prisma calls and no queue rules.
+- **Service:** enforce permissions, states, orchestration, and error codes.
+- **Repository:** own Prisma queries, row locks, and database transactions.
+- **Mapper:** convert database records into safe public DTOs.
+- **Realtime publisher:** emit only after the repository transaction commits.
+- **Middleware:** authenticate and validate before a controller runs.
+
+For the first implementation, `PublicTicketController` and `StaffTicketController` may be exported functions in the same `ticket.controller.ts`. Split them only when the file becomes difficult to navigate.
+
+## 26. Frontend module diagram
+
+React uses functions and hooks rather than long-lived page classes, but the responsibilities can still be shown precisely:
+
+```mermaid
+classDiagram
+    direction TB
+
+    class HttpClient {
+        +get(path, schema) Promise
+        +post(path, body, schema) Promise
+        +setTicketToken(token) void
+    }
+
+    class PublicQueueApi {
+        +getQueue(slug) Promise~PublicQueueView~
+        +joinQueue(slug, requestId, token) Promise~CustomerTicketView~
+    }
+
+    class CustomerTicketApi {
+        +getOwnTicket(token) Promise~CustomerTicketView~
+        +cancelOwnTicket(token) Promise~CustomerTicketView~
+    }
+
+    class StaffApi {
+        +login(credentials) Promise~StaffUserView~
+        +getSnapshot(queueId) Promise~StaffQueueSnapshot~
+        +callNext(queueId, counterId) Promise~StaffTicketView~
+        +recall(ticketId) Promise~StaffTicketView~
+        +start(ticketId) Promise~StaffTicketView~
+        +complete(ticketId) Promise~StaffTicketView~
+        +markNoShow(ticketId) Promise~StaffTicketView~
+    }
+
+    class SocketClient {
+        +connectStaff() void
+        +connectTicket(token) void
+        +joinPublicQueue(slug) void
+        +onChanged(handler) unsubscribe
+        +disconnect() void
+    }
+
+    class TicketStorage {
+        +save(queueSlug, token, requestId) void
+        +load(queueSlug) StoredTicket
+        +clear(queueSlug) void
+    }
+
+    class JoinQueuePage {
+        <<React page>>
+        +loadQueue() void
+        +handleJoin() Promise~void~
+    }
+
+    class CustomerTicketPage {
+        <<React page>>
+        +loadTicket() void
+        +handleCancel() Promise~void~
+        +handleReconnect() void
+    }
+
+    class KioskPage {
+        <<React page>>
+        +loadBoard() void
+        +subscribeToQueue() void
+    }
+
+    class StaffDashboardPage {
+        <<React page>>
+        +loadSnapshot() void
+        +handleCallNext(counterId) Promise~void~
+        +handleTicketAction(action) Promise~void~
+    }
+
+    PublicQueueApi --> HttpClient
+    CustomerTicketApi --> HttpClient
+    StaffApi --> HttpClient
+    JoinQueuePage --> PublicQueueApi
+    JoinQueuePage --> TicketStorage
+    CustomerTicketPage --> CustomerTicketApi
+    CustomerTicketPage --> TicketStorage
+    CustomerTicketPage --> SocketClient
+    KioskPage --> PublicQueueApi
+    KioskPage --> SocketClient
+    StaffDashboardPage --> StaffApi
+    StaffDashboardPage --> SocketClient
+```
+
+TanStack Query owns server-state caching. When Socket.IO announces a change, the relevant query is invalidated:
+
+```text
+ticket:changed       → invalidate customer-ticket query
+queue:public-changed → invalidate public-board and public-queue queries
+queue:staff-changed  → invalidate staff-snapshot query
+reconnect            → invalidate every query used by that screen
+```
+
+## 27. Method behavior catalogue
+
+| Method | Required behavior | Main errors |
+|---|---|---|
+| `AuthService.login` | Normalize email, find user, verify Argon2id hash, issue eight-hour cookie claims | `INVALID_CREDENTIALS`, `RATE_LIMITED` |
+| `QueueService.getPublicQueue` | Return name, slug, open state, and waiting count only | `QUEUE_NOT_FOUND` |
+| `QueueService.getBoard` | Return called/serving display numbers and counter names only | `QUEUE_NOT_FOUND` |
+| `QueueService.openQueue` | Verify organization access, set `isOpen=true`, publish public/staff invalidations | `FORBIDDEN`, `QUEUE_NOT_FOUND` |
+| `QueueService.closeQueue` | Stop new joins without deleting active tickets | `FORBIDDEN`, `QUEUE_NOT_FOUND` |
+| `TicketService.joinQueue` | Validate token/request ID, ensure queue is open, create daily number and event atomically, publish | `QUEUE_CLOSED`, `VALIDATION_ERROR` |
+| `TicketService.getCustomerTicket` | Hash token, locate ticket, count tickets ahead, map safe DTO | `TICKET_NOT_FOUND` |
+| `TicketService.cancelTicket` | Permit `WAITING → CANCELLED`, add event, publish | `INVALID_TICKET_STATE` |
+| `TicketService.callNext` | Check actor/counter, atomically lock FIFO ticket, assign counter, set `CALLED`, add event, publish | `QUEUE_EMPTY`, `COUNTER_BUSY`, `FORBIDDEN` |
+| `TicketService.recall` | Require `CALLED`, append `RECALLED`; do not change status | `INVALID_TICKET_STATE` |
+| `TicketService.startService` | Permit `CALLED → SERVING`, timestamp and add event | `INVALID_TICKET_STATE` |
+| `TicketService.completeTicket` | Permit `SERVING → COMPLETED`, timestamp and add event | `INVALID_TICKET_STATE` |
+| `TicketService.markNoShow` | Permit `CALLED → NO_SHOW`, timestamp and add event | `INVALID_TICKET_STATE` |
+| `TicketStateMachine.assertTransition` | Reject every transition not present in the allowed-transition table | `INVALID_TICKET_STATE` |
+| `CustomerTokenService.hash` | Produce deterministic SHA-256 for lookup; never log input | `VALIDATION_ERROR` |
+
+## 28. Request realization path
+
+Every command follows the same path:
+
+```mermaid
+sequenceDiagram
+    participant UI as React UI
+    participant R as Express Route
+    participant M as Middleware
+    participant C as Controller
+    participant S as Application Service
+    participant Repo as Repository
+    participant DB as PostgreSQL
+    participant RT as Realtime Publisher
+
+    UI->>R: HTTP command
+    R->>M: Authenticate and validate
+    M->>C: Typed request
+    C->>S: Call use-case method
+    S->>Repo: Execute query or transaction
+    Repo->>DB: Lock, read, and write
+    DB-->>Repo: Committed result
+    Repo-->>S: Domain result
+    S->>RT: Announce change after commit
+    S-->>C: Safe response DTO
+    C-->>UI: JSON response
+    RT-->>UI: Invalidation event
+    UI->>R: Refetch authoritative snapshot
+```
+
+If Socket.IO emission fails after a commit, the database result stays valid. Connected clients recover by polling manually, refreshing, or refetching after reconnection.
+
+### Use-case traceability matrix
+
+| User action | Route | Service method | Repository method | Event | Main UI |
+|---|---|---|---|---|---|
+| View queue | `GET /public/queues/:slug` | `getPublicQueue` | `findBySlug` | None | `JoinQueuePage` |
+| Join | `POST /public/queues/:slug/tickets` | `joinQueue` | `createWithDailyNumber` | All three change events | `JoinQueuePage` |
+| Restore ticket | `GET /public/tickets/me` | `getCustomerTicket` | `findByTokenHash`, `countAhead` | None | `CustomerTicketPage` |
+| Cancel | `POST /public/tickets/me/cancel` | `cancelTicket` | `cancelWaitingByToken` | All three change events | `CustomerTicketPage` |
+| Staff snapshot | `GET /staff/queues/:id/snapshot` | `getStaffSnapshot` | `getStaffSnapshot` | None | `StaffDashboardPage` |
+| Call next | `POST /staff/queues/:id/call-next` | `callNext` | `callNextAtomic` | All three change events | `StaffDashboardPage` |
+| Recall | `POST /staff/tickets/:id/recall` | `recall` | `recordRecall` | `ticket:recalled` | `StaffDashboardPage` |
+| Start | `POST /staff/tickets/:id/start` | `startService` | `transitionAtomic` | All three change events | `StaffDashboardPage` |
+| Complete | `POST /staff/tickets/:id/complete` | `completeTicket` | `transitionAtomic` | All three change events | `StaffDashboardPage` |
+| No-show | `POST /staff/tickets/:id/no-show` | `markNoShow` | `transitionAtomic` | All three change events | `StaffDashboardPage` |
+
+## 29. Concrete backend file map
+
+```text
+apps/api/src/
+├── config/
+│   └── env.ts                       # Parse and validate process.env
+├── db/
+│   └── prisma.ts                    # One PrismaClient instance
+├── errors/
+│   ├── app-error.ts
+│   └── error-codes.ts
+├── middleware/
+│   ├── error-handler.ts
+│   ├── require-staff.ts
+│   ├── require-queue-access.ts
+│   ├── ticket-token.ts
+│   ├── validate.ts
+│   ├── request-id.ts
+│   ├── origin-check.ts
+│   └── rate-limit.ts
+├── modules/
+│   ├── auth/
+│   │   ├── auth.routes.ts
+│   │   ├── auth.controller.ts
+│   │   ├── auth.service.ts
+│   │   ├── auth.repository.ts
+│   │   ├── auth.schemas.ts
+│   │   ├── password-hasher.ts
+│   │   └── session-signer.ts
+│   ├── queues/
+│   │   ├── queue.routes.ts
+│   │   ├── queue.controller.ts
+│   │   ├── queue.service.ts
+│   │   ├── queue.repository.ts
+│   │   ├── queue.mapper.ts
+│   │   └── queue.schemas.ts
+│   └── tickets/
+│       ├── ticket.routes.ts
+│       ├── ticket.controller.ts
+│       ├── ticket.service.ts
+│       ├── ticket.repository.ts
+│       ├── ticket.mapper.ts
+│       ├── ticket.schemas.ts
+│       ├── ticket-state-machine.ts
+│       ├── customer-token.service.ts
+│       └── call-next.query.ts
+├── realtime/
+│   ├── socket-server.ts
+│   ├── socket-auth.ts
+│   ├── room-names.ts
+│   └── realtime-publisher.ts
+├── app.ts
+└── server.ts
+```
+
+Start with one file per row above only when its behavior is introduced. In particular, repository files can initially call Prisma directly and later be split into smaller query files.
+
+## 30. Concrete frontend file map
+
+```text
+apps/web/src/
+├── api/
+│   ├── http-client.ts
+│   ├── api-error.ts
+│   └── query-client.ts
+├── components/
+│   ├── Button.tsx
+│   ├── ErrorMessage.tsx
+│   ├── LoadingSpinner.tsx
+│   ├── StatusBadge.tsx
+│   └── ConnectionIndicator.tsx
+├── features/
+│   ├── customer/
+│   │   ├── api/
+│   │   │   ├── get-public-queue.ts
+│   │   │   ├── join-queue.ts
+│   │   │   ├── get-own-ticket.ts
+│   │   │   └── cancel-own-ticket.ts
+│   │   ├── components/
+│   │   │   ├── JoinQueueCard.tsx
+│   │   │   └── CustomerTicketCard.tsx
+│   │   ├── hooks/
+│   │   │   └── use-customer-ticket.ts
+│   │   └── storage/
+│   │       └── customer-ticket-storage.ts
+│   ├── kiosk/
+│   │   ├── api/get-board.ts
+│   │   └── components/
+│   │       ├── QueueQrCode.tsx
+│   │       └── NowServingBoard.tsx
+│   └── staff/
+│       ├── api/
+│       │   ├── auth.ts
+│       │   ├── get-staff-snapshot.ts
+│       │   └── ticket-actions.ts
+│       ├── components/
+│       │   ├── LoginForm.tsx
+│       │   ├── WaitingList.tsx
+│       │   ├── ActiveTicket.tsx
+│       │   └── CounterControls.tsx
+│       └── routes/ProtectedStaffRoute.tsx
+├── pages/
+│   ├── JoinQueuePage.tsx
+│   ├── CustomerTicketPage.tsx
+│   ├── KioskPage.tsx
+│   ├── StaffLoginPage.tsx
+│   └── StaffDashboardPage.tsx
+├── realtime/
+│   ├── socket-client.ts
+│   ├── use-connection-status.ts
+│   ├── use-ticket-events.ts
+│   └── use-queue-events.ts
+├── routes/router.tsx
+├── styles/global.css
+└── main.tsx
+```
+
+## 31. Detailed realization sequence
+
+Build in vertical slices. A vertical slice completes one small behavior through contracts, backend, database, frontend, and tests:
+
+```mermaid
+flowchart LR
+    Contract[Shared contract] --> Test[Failing service or integration test]
+    Test --> Route[Route and controller]
+    Route --> Service[Service and repository]
+    Service --> DB[(PostgreSQL)]
+    Service --> Client[Frontend API function]
+    Client --> Screen[React screen]
+    Screen --> Demo[Demonstrable behavior]
+```
+
+Do not build the entire backend and then begin the frontend. Integrate a small flow at the end of every slice.
+
+```mermaid
+flowchart TD
+    S0[0. Freeze behavior and wireframes] --> S1[1. Create runnable workspace]
+    S1 --> S2[2. Create and seed database]
+    S2 --> S3[3. Define shared contracts]
+    S3 --> S4[4. View public queue]
+    S4 --> S5[5. Join and restore ticket]
+    S5 --> S6[6. Add staff authentication]
+    S6 --> S7[7. Staff snapshot and safe Call Next]
+    S7 --> S8[8. Add realtime invalidation]
+    S8 --> S9[9. Complete ticket lifecycle]
+    S9 --> S10[10. Finish kiosk and UX]
+    S10 --> S11[11. Reliability and delivery]
+```
+
+### Step 0 — Freeze behavior and wireframes
+
+Create:
+
+```text
+docs/decisions/001-postgresql-source-of-truth.md
+docs/decisions/002-authentication.md
+docs/decisions/003-ticket-lifecycle.md
+docs/wireframes/join-queue.png
+docs/wireframes/customer-ticket.png
+docs/wireframes/kiosk.png
+docs/wireframes/staff-login.png
+docs/wireframes/staff-dashboard.png
+docs/api.md
+```
+
+Tasks:
+
+- Copy the frozen decisions, endpoints, states, errors, and events into the appropriate documents.
+- Sketch the five pages at mobile/desktop sizes as appropriate.
+- Make every button correspond to exactly one API command.
+- Agree on the counter-busy behavior and demonstration credentials.
+
+Checkpoint: both developers can trace every button from screen to endpoint to allowed state transition.
+
+### Step 1 — Create a runnable workspace
+
+Create the root workspace, React/Vite app, Express app, shared package, Docker Compose PostgreSQL, TypeScript, ESLint, Prettier, and test runners.
+
+Minimum runnable files:
+
+```text
+apps/api/src/app.ts
+apps/api/src/server.ts
+apps/api/src/config/env.ts
+apps/web/src/main.tsx
+apps/web/src/routes/router.tsx
+packages/shared/src/index.ts
+```
+
+Add `GET /health`, environment validation, and root scripts for `dev`, `build`, `lint`, `typecheck`, and `test`.
+
+Checkpoint: a fresh clone can start PostgreSQL, API, and web app by following the README; `/health` returns `200`.
+
+### Step 2 — Create and seed the database
+
+Implement Prisma models in dependency order: `Organization`, `User`, `Queue`, `Counter`, `Ticket`, `TicketEvent`. Add the constraints and indexes from the data-model section.
+
+Seed predictably:
+
+```text
+Organization: Demo Organization
+Queue: General, slug general, prefix A
+Counter: Counter 1
+Staff: staff@example.com
+```
+
+Make the seed idempotent so running it twice does not create duplicates.
+
+Checkpoint: a blank database can be migrated and seeded, and all relationships are visible through a query or Prisma Studio.
+
+### Step 3 — Define shared contracts
+
+Create:
+
+```text
+packages/shared/src/types/ticket-status.ts
+packages/shared/src/contracts/public-queue.contract.ts
+packages/shared/src/contracts/customer-ticket.contract.ts
+packages/shared/src/contracts/staff-snapshot.contract.ts
+packages/shared/src/contracts/errors.contract.ts
+packages/shared/src/events/socket-events.ts
+```
+
+If a value crosses HTTP or Socket.IO, define its public shape here. Never send Prisma records directly to browsers.
+
+Checkpoint: both apps import the same contracts, and private fields such as `passwordHash` and `publicTokenHash` are absent.
+
+### Step 4 — Vertical slice: view a public queue
+
+Implement `GET /api/public/queues/:slug`, the queue mapper, frontend query, and `/q/:queueSlug` page.
+
+Acceptance checks:
+
+- Existing slug returns queue name, slug, open state, and waiting count.
+- Unknown slug returns `404 QUEUE_NOT_FOUND`.
+- Closed queues disable the Join button.
+- No internal UUID or private data is returned.
+
+Checkpoint: `/q/general` renders data loaded from PostgreSQL.
+
+### Step 5 — Vertical slice: join and restore a ticket
+
+Implement `POST /api/public/queues/:slug/tickets`, `GET /api/public/tickets/me`, customer token storage, and `/ticket`.
+
+Join sequence:
+
+1. Browser creates a 32-byte base64url token and UUID request ID.
+2. Browser stores both before sending the request.
+3. Browser sends the token in the body and request ID as `Idempotency-Key`.
+4. Server validates both and hashes the token with SHA-256.
+5. Transaction locks the queue row, resolves the local service date, resets/increments the daily number, inserts ticket and event, then commits.
+6. Server returns a safe `CustomerTicketView`.
+7. Browser navigates to `/ticket` and uses `X-Ticket-Token` for future requests.
+
+Acceptance checks:
+
+- Joining an open queue produces `A-001` with `WAITING`.
+- A closed queue returns `409 QUEUE_CLOSED`.
+- Retrying the same request ID and token returns the existing ticket without duplication.
+- Two new requests receive consecutive unique numbers.
+- Only the token hash appears in PostgreSQL.
+- Reload restores the ticket from localStorage.
+
+Checkpoint: join, see `A-001`, reload, and see the same ticket.
+
+### Step 6 — Vertical slice: staff authentication
+
+Implement login, logout, current-user endpoint, Argon2id verification, JWT cookie, staff middleware, protected React route, and login page.
+
+Acceptance checks:
+
+- Correct credentials set an HttpOnly cookie.
+- Incorrect credentials return a generic error.
+- Anonymous requests cannot access staff routes.
+- Staff from another organization cannot manage the queue.
+- Logout removes access and reload restores a valid session.
+- Login is rate-limited.
+
+Checkpoint: staff can enter the protected dashboard shell only after login.
+
+### Step 7 — Vertical slice: snapshot and concurrency-safe Call Next
+
+Implement:
+
+```http
+GET  /api/staff/queues/:queueId/snapshot
+POST /api/staff/queues/:queueId/call-next
+Content-Type: application/json
+
+{ "counterId": "..." }
+```
+
+The transaction must check that the counter is active/free, lock the oldest waiting ticket with `FOR UPDATE SKIP LOCKED`, assign the counter, set `CALLED`, and insert its event before committing.
+
+Acceptance checks:
+
+- Oldest ticket is called first using `(joinedAt, id)` ordering.
+- Empty queue returns `409 QUEUE_EMPTY`.
+- Busy counter returns `409 COUNTER_BUSY`.
+- A called ticket is never called as new again.
+- Two simultaneous requests using different counters receive different tickets.
+- Refreshing the dashboard restores database state.
+
+Checkpoint: create three tickets and serve them in FIFO order. The simultaneous-call integration test is a gate for continuing.
+
+### Step 8 — Vertical slice: real-time invalidation
+
+Implement server rooms, socket authentication, publisher, client hooks, connection indicator, and query invalidation.
+
+Rules:
+
+1. Commit PostgreSQL first.
+2. Emit change events after a successful commit.
+3. Validate every room join on the server.
+4. Refetch REST state when an event arrives.
+5. Refetch all screen queries after reconnection.
+
+Acceptance checks:
+
+- Customer receives only their private ticket changes.
+- Kiosk receives only public queue changes.
+- Authorized staff receives staff invalidations.
+- A ticket token cannot join another ticket room.
+- Failed transactions emit nothing.
+- Reconnection restores current state.
+
+Checkpoint: show the customer, kiosk, and staff pages side by side; Call Next updates all three without a manual refresh.
+
+### Step 9 — Vertical slice: complete the lifecycle
+
+Implement cancellation, recall, start, complete, no-show, and queue open/close one at a time. For every transition: validate actor, validate current state, update ticket and event transactionally, commit, publish, return mapped DTO.
+
+| Action | Valid state | Result |
+|---|---|---|
+| Cancel | `WAITING` | `CANCELLED` |
+| Recall | `CALLED` | `RECALLED` event; remains `CALLED` |
+| Start | `CALLED` | `SERVING` |
+| Complete | `SERVING` | `COMPLETED` |
+| No-show | `CALLED` | `NO_SHOW` |
+
+Checkpoint: complete one normal journey, one cancellation, and one no-show; tests reject every invalid transition.
+
+### Step 10 — Finish kiosk and user experience
+
+Add the QR code `${PUBLIC_APP_URL}/q/general`, large called numbers, counter name, full-screen kiosk layout, mobile customer layout, loading/empty/error/terminal states, pending-button disabling, accessibility labels, keyboard support, and visible connection state.
+
+Checkpoint: QR opens the correct join page; the kiosk exposes no UUIDs, tokens, email, or staff data; the customer flow is usable at mobile width.
+
+### Step 11 — Reliability and delivery
+
+Finish unit, integration, Socket authorization, and Playwright tests. Add request IDs, structured logs, `/ready`, production builds, clean-database migration test, restart test, environment documentation, and demo instructions.
+
+```mermaid
+flowchart LR
+    Clone --> Install
+    Install --> StartDB[Start PostgreSQL]
+    StartDB --> Migrate
+    Migrate --> Seed
+    Seed --> Run[Run web and API]
+    Run --> Demo[Complete queue journey]
+    Demo --> Restart[Restart server]
+    Restart --> Verify[Verify persisted state]
+```
+
+Checkpoint: a teammate can clone the repository and complete the entire demonstration using only the README.
+
+## 32. Coding recipes for difficult behavior
+
+### Ticket state machine
+
+```ts
+const allowedTransitions: Record<TicketStatus, readonly TicketStatus[]> = {
+  WAITING: ["CALLED", "CANCELLED"],
+  CALLED: ["SERVING", "NO_SHOW"],
+  SERVING: ["COMPLETED"],
+  COMPLETED: [],
+  CANCELLED: [],
+  NO_SHOW: [],
+};
+
+export class TicketStateMachine {
+  canTransition(from: TicketStatus, to: TicketStatus): boolean {
+    return allowedTransitions[from].includes(to);
+  }
+
+  assertTransition(from: TicketStatus, to: TicketStatus): void {
+    if (!this.canTransition(from, to)) {
+      throw new AppError("INVALID_TICKET_STATE", 409);
+    }
+  }
+
+  isTerminal(status: TicketStatus): boolean {
+    return allowedTransitions[status].length === 0;
+  }
+}
+```
+
+Recall is intentionally absent because it is an event, not a state transition.
+
+### Idempotent ticket creation transaction
+
+```ts
+async function createWithDailyNumber(input: JoinInput): Promise<TicketRecord> {
+  return db.$transaction(async (tx) => {
+    const replay = await tx.ticket.findUnique({
+      where: {
+        queueId_joinRequestId: {
+          queueId: input.queueId,
+          joinRequestId: input.joinRequestId,
+        },
+      },
+    });
+    if (replay) return replay;
+
+    const queue = await lockQueueRow(tx, input.queueId);
+    if (!queue.isOpen) throw new AppError("QUEUE_CLOSED", 409);
+
+    const serviceDate = dateInQueueTimezone("Africa/Casablanca");
+    const sequenceNumber = nextDailyNumber(queue, serviceDate);
+    await saveDailyNumber(tx, queue.id, serviceDate, sequenceNumber);
+
+    const ticket = await tx.ticket.create({
+      data: {
+        queueId: queue.id,
+        publicTokenHash: input.publicTokenHash,
+        joinRequestId: input.joinRequestId,
+        serviceDate,
+        sequenceNumber,
+        displayNumber: `${queue.prefix}-${String(sequenceNumber).padStart(3, "0")}`,
+        status: "WAITING",
+      },
+    });
+
+    await tx.ticketEvent.create({
+      data: { ticketId: ticket.id, type: "CREATED" },
+    });
+    return ticket;
+  });
+}
+```
+
+`lockQueueRow`, `dateInQueueTimezone`, and `saveDailyNumber` are small helpers whose behavior must have integration/unit tests. The actual raw SQL identifiers must match the Prisma migration.
+
+### Atomic Call Next transaction
+
+```ts
+async function callNextAtomic(
+  queueId: string,
+  counterId: string,
+  actorId: string,
+): Promise<TicketRecord> {
+  return db.$transaction(async (tx) => {
+    await assertCounterAvailable(tx, queueId, counterId);
+
+    const rows = await tx.$queryRaw<TicketRecord[]>`
+      SELECT *
+      FROM "Ticket"
+      WHERE "queueId" = ${queueId}
+        AND "status" = 'WAITING'
+      ORDER BY "joinedAt", "id"
+      FOR UPDATE SKIP LOCKED
+      LIMIT 1
+    `;
+
+    const next = rows[0];
+    if (!next) throw new AppError("QUEUE_EMPTY", 409);
+
+    const updated = await tx.ticket.update({
+      where: { id: next.id },
+      data: {
+        status: "CALLED",
+        counterId,
+        calledAt: new Date(),
+      },
+    });
+
+    await tx.ticketEvent.create({
+      data: {
+        ticketId: updated.id,
+        actorUserId: actorId,
+        type: "CALLED",
+        metadata: { counterId },
+      },
+    });
+    return updated;
+  });
+}
+```
+
+The service calls the realtime publisher only after `callNextAtomic` resolves successfully.
+
+### Generic guarded transition
+
+```ts
+async function transitionAtomic(input: TransitionInput): Promise<TicketRecord> {
+  return db.$transaction(async (tx) => {
+    const result = await tx.ticket.updateMany({
+      where: { id: input.ticketId, status: input.expectedStatus },
+      data: {
+        status: input.nextStatus,
+        ...input.timestamps,
+      },
+    });
+
+    if (result.count !== 1) {
+      throw new AppError("INVALID_TICKET_STATE", 409);
+    }
+
+    await tx.ticketEvent.create({
+      data: {
+        ticketId: input.ticketId,
+        actorUserId: input.actorId,
+        type: input.eventType,
+      },
+    });
+
+    return tx.ticket.findUniqueOrThrow({ where: { id: input.ticketId } });
+  });
+}
+```
+
+The conditional `expectedStatus` prevents two simultaneous actions from both succeeding.
+
+## 33. Route authorization matrix
+
+| Route group | Validation | Credential | Organization check | Rate limit |
+|---|---|---|---|---|
+| `POST /auth/login` | Body schema | None | No | Strict |
+| Public queue reads | Params schema | None | No | General |
+| Public ticket join | Params, body, idempotency header | None | No | Strict per IP/queue |
+| Customer ticket read/cancel | Token-header format | Customer token | Ticket ownership by token hash | General |
+| Staff queue reads/actions | Params/body schema | Staff JWT cookie | `user.organizationId == queue.organizationId` | General |
+| Staff ticket actions | Params/body schema | Staff JWT cookie | Ticket queue belongs to staff organization | General |
+| Public Socket room | Queue identifier | None | Public room only | Connection limit |
+| Customer Socket room | Handshake token | Customer token | Exact ticket match | Connection limit |
+| Staff Socket room | Cookie handshake | Staff JWT | Queue organization match | Connection limit |
+
+Every state-changing cookie-authenticated request validates `Origin`. If frontend and API require cross-site cookies in deployment, add an explicit CSRF-token mechanism before release.
+
+## 34. Standard error contract
+
+```ts
+type ApiError = {
+  error: {
+    code:
+      | "VALIDATION_ERROR"
+      | "UNAUTHENTICATED"
+      | "FORBIDDEN"
+      | "INVALID_CREDENTIALS"
+      | "QUEUE_NOT_FOUND"
+      | "QUEUE_CLOSED"
+      | "QUEUE_EMPTY"
+      | "COUNTER_BUSY"
+      | "TICKET_NOT_FOUND"
+      | "INVALID_TICKET_STATE"
+      | "RATE_LIMITED"
+      | "INTERNAL_ERROR";
+    message: string;
+    requestId: string;
+    details?: Record<string, string[]>;
+  };
+};
+```
+
+Use `201` for new ticket creation, `200` for queries/actions/idempotent replay, `401` for missing or invalid credentials, `403` for wrong organization, `404` for absent resources, `409` for business conflicts, `422` for validation, and `429` for rate limiting.
+
+## 35. Two-developer realization workflow
+
+Split leadership by vertical slice rather than permanently assigning one person to all frontend work and the other to all backend work.
+
+| Slice | Developer A lead | Developer B lead | Complete together |
+|---|---|---|---|
+| Foundation | API and database setup | Web and shared-package setup | Root scripts and README |
+| Public queue | Backend endpoint | Join page | Contract and acceptance test |
+| Join ticket | Transaction and tokens | Customer flow and storage | Integration test |
+| Authentication | Auth service/middleware | Login and protected route | Permission review |
+| Call Next | Locking query | Staff dashboard | Concurrency demonstration |
+| Real time | Socket server | Socket client | Three-screen test |
+| Lifecycle | Transition service | Staff/customer controls | Invalid-state tests |
+| Delivery | API integration tests | Playwright/accessibility | Fresh-clone rehearsal |
+
+```mermaid
+flowchart LR
+    Agree[Agree on contract] --> Implement[Implement independently]
+    Implement --> PR[Open small pull request]
+    PR --> Review[Teammate reviews]
+    Review --> Run[Run the slice together]
+    Run --> Merge[Merge after checkpoint passes]
+```
+
+For each feature, create or update artifacts in this order:
+
+1. User story and acceptance criteria
+2. Shared request/response schema
+3. Error and event types
+4. Failing service or integration test
+5. Repository and service method
+6. Controller, validation, and route
+7. Frontend API function
+8. React component or page
+9. Realtime publisher/handler where required
+10. End-to-end acceptance test
+11. Documentation
+
+## 36. Definition of Ready and realization gates
+
+### Definition of Ready
+
+A task enters implementation only when:
+
+- Its user story and testable acceptance criteria exist.
+- Valid and invalid ticket states are known.
+- Request, response, errors, and authorization are defined.
+- Its required predecessor slice is complete.
+- A developer and reviewer are assigned.
+
+### Definition of Done for each slice
+
+- User-visible behavior works through all required layers.
+- The server validates input, authentication, and authorization.
+- Database writes are transactional where required.
+- Success and important failure paths have automated tests.
+- Loading, empty, error, disabled, and retry states are handled.
+- Reload/reconnection recovery works where relevant.
+- Contracts and documentation match the code.
+- `lint`, `typecheck`, `test`, and `build` pass.
+- The teammate reviewed it.
+- Its checkpoint can be demonstrated without manually editing the database.
+
+### Do not expand the product until all gates pass
+
+- Full customer journey works.
+- Simultaneous Call Next test passes.
+- Three screens update live.
+- Invalid ticket transitions are rejected.
+- Staff HTTP routes and Socket rooms are protected.
+- Customer tokens do not appear in URLs, logs, or database plaintext.
+- Server restart preserves queue state.
+- Fresh clone setup and demonstration work from the README.
